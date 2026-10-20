@@ -18,6 +18,7 @@ contract TokenFactoryProbe {
     }
 }
 
+/// forge-config: default.fuzz.runs = 1000
 contract GoatProTest is Test {
     uint256 internal constant SUPPLY = 1_000_000_000_000_000_000_000_000_000;
 
@@ -332,7 +333,8 @@ contract GoatProTest is Test {
     }
 
     function testFuzz_TransferConservesSupply(address recipient, uint256 amount) public {
-        vm.assume(recipient != address(0) && recipient != deployer);
+        recipient = address(uint160(bound(uint160(recipient), 1, type(uint160).max)));
+        if (recipient == deployer) recipient = alice;
         amount = bound(amount, 0, SUPPLY);
         vm.prank(deployer);
         assertTrue(token.transfer(recipient, amount));
@@ -378,5 +380,337 @@ contract GoatProTest is Test {
         assertEq(token.allowance(deployer, spender), approved);
         assertEq(token.balanceOf(deployer), SUPPLY);
         assertEq(token.balanceOf(alice), 0);
+    }
+
+    function test_OneWeiAllowanceCannotBeReusedAfterTokensReturn() public {
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, 1));
+        vm.expectEmit(true, true, false, true, address(token));
+        emit IERC20.Transfer(deployer, alice, 1);
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, alice, 1));
+        assertEq(token.balanceOf(alice), 1);
+        assertEq(token.allowance(deployer, spender), 0);
+
+        vm.prank(alice);
+        assertTrue(token.transfer(deployer, 1));
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        vm.prank(spender);
+        token.transferFrom(deployer, alice, 1);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.allowance(deployer, spender), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_OneBelowMaximumAllowanceIsFinite() public {
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, type(uint256).max - 1));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, alice, 1));
+        assertEq(token.allowance(deployer, spender), type(uint256).max - 2);
+        assertEq(token.balanceOf(deployer), SUPPLY - 1);
+        assertEq(token.balanceOf(alice), 1);
+    }
+
+    function test_UnlimitedAllowanceCanBeRevokedAndReplacedWithFiniteAllowance() public {
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, type(uint256).max));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, alice, 1));
+        assertEq(token.allowance(deployer, spender), type(uint256).max);
+
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, 0));
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        vm.prank(spender);
+        token.transferFrom(deployer, alice, 1);
+        assertEq(token.balanceOf(alice), 1);
+        assertEq(token.allowance(deployer, spender), 0);
+
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, 2));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, alice, 2));
+        assertEq(token.allowance(deployer, spender), 0);
+        assertEq(token.balanceOf(alice), 3);
+        assertEq(token.balanceOf(deployer), SUPPLY - 3);
+    }
+
+    function test_HolderNeedsSelfApprovalForTransferFrom() public {
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, deployer, 0, 1));
+        vm.prank(deployer);
+        token.transferFrom(deployer, alice, 1);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+        assertEq(token.balanceOf(alice), 0);
+
+        vm.prank(deployer);
+        assertTrue(token.approve(deployer, 1));
+        vm.prank(deployer);
+        assertTrue(token.transferFrom(deployer, alice, 1));
+        assertEq(token.allowance(deployer, deployer), 0);
+        assertEq(token.balanceOf(deployer), SUPPLY - 1);
+        assertEq(token.balanceOf(alice), 1);
+    }
+
+    function test_DelegatedTransferToSpenderCreditsOnlyOnce() public {
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, 10));
+        vm.prank(alice);
+        assertTrue(token.approve(spender, 10));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(alice, spender, 10));
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.balanceOf(spender), 10);
+        assertEq(token.balanceOf(deployer), SUPPLY - 10);
+        assertEq(token.allowance(alice, spender), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_MaximumUintTransferFailsEvenWithUnlimitedApproval() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, deployer, SUPPLY, type(uint256).max)
+        );
+        vm.prank(deployer);
+        token.transfer(alice, type(uint256).max);
+
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, type(uint256).max));
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, deployer, SUPPLY, type(uint256).max)
+        );
+        vm.prank(spender);
+        token.transferFrom(deployer, alice, type(uint256).max);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.allowance(deployer, spender), type(uint256).max);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_ZeroApprovalToZeroSpenderReverts() public {
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0)));
+        vm.prank(deployer);
+        token.approve(address(0), 0);
+        assertEq(token.allowance(deployer, address(0)), 0);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+    }
+
+    function test_ZeroDelegatedTransferToZeroReceiverReverts() public {
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, 5));
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        vm.prank(spender);
+        token.transferFrom(deployer, address(0), 0);
+        assertEq(token.allowance(deployer, spender), 5);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+        assertEq(token.balanceOf(address(0)), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_TransferFromZeroSenderCannotMint() public {
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        vm.prank(spender);
+        token.transferFrom(address(0), alice, 1);
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.balanceOf(address(0)), 0);
+        assertEq(token.allowance(address(0), spender), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_ApprovalFromAnotherOwnerDoesNotAuthorizeSpending() public {
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, 10));
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, 10));
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 10));
+        vm.prank(spender);
+        token.transferFrom(alice, bob, 10);
+        assertEq(token.balanceOf(alice), 10);
+        assertEq(token.balanceOf(bob), 0);
+        assertEq(token.allowance(deployer, spender), 10);
+        assertEq(token.allowance(alice, spender), 0);
+    }
+
+    function testFuzz_TransferRoundTripPreservesBalancesAndApprovals(
+        uint256 startingBalance,
+        uint256 amount,
+        uint256 approved
+    ) public {
+        startingBalance = bound(startingBalance, 0, SUPPLY);
+        amount = bound(amount, 0, SUPPLY - startingBalance);
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, startingBalance));
+        vm.prank(alice);
+        assertTrue(token.approve(spender, approved));
+
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, amount));
+        assertEq(token.balanceOf(alice), startingBalance + amount);
+        vm.prank(alice);
+        assertTrue(token.transfer(deployer, amount));
+
+        assertEq(token.balanceOf(deployer), SUPPLY - startingBalance);
+        assertEq(token.balanceOf(alice), startingBalance);
+        assertEq(token.balanceOf(spender), 0);
+        assertEq(token.allowance(alice, spender), approved);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_SplitTransfersMatchSingleTransfer(uint256 amount, uint256 first) public {
+        amount = bound(amount, 0, SUPPLY);
+        first = bound(first, 0, amount);
+        vm.prank(deployer);
+        GoatPro singleTransferToken = new GoatPro();
+
+        vm.startPrank(deployer);
+        assertTrue(singleTransferToken.transfer(alice, amount));
+        assertTrue(token.transfer(alice, first));
+        assertTrue(token.transfer(alice, amount - first));
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(alice), amount);
+        assertEq(token.balanceOf(alice), singleTransferToken.balanceOf(alice));
+        assertEq(token.balanceOf(deployer), singleTransferToken.balanceOf(deployer));
+        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(singleTransferToken.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_ApprovalReplacementIsIdempotentAndIsolated(uint256 first, uint256 replacement) public {
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, 100));
+        vm.startPrank(deployer);
+        assertTrue(token.approve(bob, 42));
+        assertTrue(token.approve(spender, first));
+        vm.stopPrank();
+        vm.prank(alice);
+        assertTrue(token.approve(spender, 7));
+
+        vm.startPrank(deployer);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit IERC20.Approval(deployer, spender, replacement);
+        assertTrue(token.approve(spender, replacement));
+        assertEq(token.allowance(deployer, spender), replacement);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit IERC20.Approval(deployer, spender, replacement);
+        assertTrue(token.approve(spender, replacement));
+        vm.stopPrank();
+
+        assertEq(token.allowance(deployer, spender), replacement);
+        assertEq(token.allowance(deployer, bob), 42);
+        assertEq(token.allowance(alice, spender), 7);
+        assertEq(token.allowance(spender, deployer), 0);
+        assertEq(token.balanceOf(deployer), SUPPLY - 100);
+        assertEq(token.balanceOf(alice), 100);
+        assertEq(token.balanceOf(spender), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_DelegatedBalanceFailureIsAtomicAndAllowanceRemainsUsable(
+        uint256 held,
+        uint256 amount,
+        uint256 approved
+    ) public {
+        held = bound(held, 1, SUPPLY);
+        amount = bound(amount, held + 1, type(uint256).max);
+        approved = bound(approved, amount, type(uint256).max);
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, held));
+        vm.prank(alice);
+        assertTrue(token.approve(spender, approved));
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, alice, held, amount));
+        vm.prank(spender);
+        token.transferFrom(alice, bob, amount);
+        assertEq(token.balanceOf(alice), held);
+        assertEq(token.balanceOf(bob), 0);
+        assertEq(token.allowance(alice, spender), approved);
+
+        vm.prank(spender);
+        assertTrue(token.transferFrom(alice, bob, held));
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.balanceOf(bob), held);
+        assertEq(token.balanceOf(deployer), SUPPLY - held);
+        assertEq(token.allowance(alice, spender), approved == type(uint256).max ? approved : approved - held);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_SelfTransferCannotBypassBalanceCheck(uint256 held, uint256 amount, bool delegated) public {
+        held = bound(held, 0, SUPPLY);
+        amount = bound(amount, held + 1, type(uint256).max);
+        vm.prank(deployer);
+        assertTrue(token.transfer(alice, held));
+        if (delegated) {
+            vm.prank(alice);
+            assertTrue(token.approve(spender, type(uint256).max));
+        }
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, alice, held, amount));
+        if (delegated) {
+            vm.prank(spender);
+            token.transferFrom(alice, alice, amount);
+        } else {
+            vm.prank(alice);
+            token.transfer(alice, amount);
+        }
+        assertEq(token.balanceOf(alice), held);
+        assertEq(token.balanceOf(deployer), SUPPLY - held);
+        assertEq(token.allowance(alice, spender), delegated ? type(uint256).max : 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_FiniteAllowanceLimitsCumulativeSpending(uint256 approved, uint256 first) public {
+        approved = bound(approved, 1, SUPPLY - 1);
+        first = bound(first, 0, approved);
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, approved));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, alice, first));
+        assertEq(token.allowance(deployer, spender), approved - first);
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, bob, approved - first));
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        vm.prank(spender);
+        token.transferFrom(deployer, spender, 1);
+        assertEq(token.allowance(deployer, spender), 0);
+        assertEq(token.balanceOf(alice), first);
+        assertEq(token.balanceOf(bob), approved - first);
+        assertEq(token.balanceOf(spender), 0);
+        assertEq(token.balanceOf(deployer), SUPPLY - approved);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_DelegatedZeroReceiverFailurePreservesFiniteAllowance(uint256 amount, uint256 approved) public {
+        amount = bound(amount, 0, SUPPLY);
+        approved = bound(approved, amount, type(uint256).max - 1);
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, approved));
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        vm.prank(spender);
+        token.transferFrom(deployer, address(0), amount);
+        assertEq(token.allowance(deployer, spender), approved);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+        assertEq(token.balanceOf(address(0)), 0);
+
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, alice, amount));
+        assertEq(token.allowance(deployer, spender), approved - amount);
+        assertEq(token.balanceOf(deployer), SUPPLY - amount);
+        assertEq(token.balanceOf(alice), amount);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzz_DelegatedSelfTransferConsumesFiniteAllowance(uint256 approved, uint256 amount) public {
+        amount = bound(amount, 0, SUPPLY);
+        approved = bound(approved, amount, type(uint256).max - 1);
+        vm.prank(deployer);
+        assertTrue(token.approve(spender, approved));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(deployer, deployer, amount));
+        assertEq(token.allowance(deployer, spender), approved - amount);
+        assertEq(token.balanceOf(deployer), SUPPLY);
+        assertEq(token.balanceOf(spender), 0);
+        assertEq(token.totalSupply(), SUPPLY);
     }
 }
